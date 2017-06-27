@@ -62,7 +62,7 @@ static void FIFOGetThread(void* pData)
 
 /*!
  * Initializing the UART
- * send parameters: baudRate = 115200, moduleClk = CPU_BUS_CLK_HZ (20,971,520 Hz)
+ * send parameters: baudRate = 115200, moduleClk = CPU_BUS_CLK_HZ
  */
 bool UART_Init(const uint32_t baudRate, const uint32_t moduleClk)
 {

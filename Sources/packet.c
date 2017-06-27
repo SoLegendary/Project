@@ -15,8 +15,6 @@
 
 #include "packet.h"
 #include "UART.h"
-#include "FTM.h"
-#include "LEDs.h"
 #include "OS.h"
 
 
@@ -60,14 +58,10 @@ bool Packet_Get(void)
         Packet_Parameter12 = (((uint16_t)(Packet_Parameter1 << 8)) || ((uint16_t)(Packet_Parameter2)));
         Packet_Parameter23 = (((uint16_t)(Packet_Parameter2 << 8)) || ((uint16_t)(Packet_Parameter3)));
 
-	packetIndex = 0; // Reset packetIndex to allow a new packet to be built
+	      packetIndex = 0; // Reset packetIndex to allow a new packet to be built
 
-	// Upon receiving a valid packet from the PC, turn on the Blue LED for 1s
-	TFTMChannel FTM0Channel0; // Struct to start a timer in Channel 0
-	FTM0Channel0.channelNb  = 0;
-	FTM0Channel0.delayCount = 1;
 
-	return true;
+	      return true;
       }
       else // If the checksum fails to validate shift the packet along so it can eventually re-sync
       {

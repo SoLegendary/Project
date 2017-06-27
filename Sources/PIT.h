@@ -34,6 +34,14 @@ bool PIT_Init(const uint32_t moduleClk, OS_ECB* semaphore[]);
  */
 void PIT_Set(const uint32_t period, const bool restart);
 
+/*! @brief gets the PIT1 timer value (used for DOR timestamping). Since the PIT timer decrements instead of
+ *  incrementing, we will take the inverse of the time (ie. (2^32)-1 - PIT_CVAL1) for the sake of clarity in the
+ *  DOR inverse timing (since real time goes up not down!)
+ *
+ *  @return returns the current time elapsed in ms
+ */
+uint32_t PIT_GetTime(void);
+
 /*! @brief Enables or disables the PIT.
  *
  *  @param enable - TRUE if the PIT is to be enabled, FALSE if the PIT is to be disabled.

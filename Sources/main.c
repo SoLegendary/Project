@@ -28,16 +28,18 @@
 
 #include "types.h"
 #include "math.h"
+#include "stdlib.h"
 
 // CPU module - contains low level hardware initialization routines
 #include "Cpu.h"
+
+// ADC and DAC converter
+#include "analog.h"
 
 // Simple OS
 #include "OS.h"
 
 // Analog functions
-#include "analog.h"
-
 // Packet/UART functionality from labs
 #include "packet.h"
 #include "UART.h"
@@ -47,6 +49,14 @@
 
 // Periodic Interrupt Timer
 #include "PIT.h"
+
+
+// NOTES FROM LAB TESTING
+
+/* Analog_Put outputs a flat DC signal forever at a value of 16000 -> 5V (make sure DSO is set to DC coupling)
+ * Use 50 Ohms output on the far right of the function generator to get the input signal
+ * Analog_Get result may need to be adjusted (probably divide by 16000)
+ */
 
 
 
@@ -60,25 +70,23 @@
 #define CMD_SETCHAR   0x13
 #define CMD_SETMODE   0x14
 
-// Trip signal outputs (5V will trip the breaker at Irms > 1.03)
-#define TRIP_SIGNAL_LOW  0
-#define TRIP_SIGNAL_HIGH 5
-
-// Private global for toggling fault-sensitive mode
-static uint32_t zeroCrossTime[2];
+// Output signals (16000 corresponds to 5V which will trip the breaker at Irms > 1.03)
+const static int16_t TIMING_SIGNAL_LOW  = 0;
+const static int16_t TIMING_SIGNAL_HIGH = 16000;
+const static int16_t TRIP_SIGNAL_LOW    = 0;
+const static int16_t TRIP_SIGNAL_HIGH   = 16000;
 
 // Private global for toggling fault-sensitive mode
 static bool SensitiveMode = false;
 
-// Private global for type of last fault
-static uint8_t FaultType = NULL;
+// Private global array to track which channels faulted in the last thread trips
+static uint8_t ChannelFault[3] = {0};
 
 // Stored in flash - Characteristic in use - 1:inverse, 2:very inverse, 3:extremely inverse
-static uint16_t *CharType = NULL;
+static uint8_t *CharType = NULL;
 
 // Stored in flash - number of times the DOR has sent out a trip signal
 static uint16_t *TimesTripped = NULL;
-
 
 
 // Lookup tables for trip timers for each of the 3 characteristic curves
@@ -86,14 +94,14 @@ static uint16_t *TimesTripped = NULL;
 // Sample calculations done at I = 1.03 and then every integer value up to 20
 
 // k = 0.14, a = 0.02
-const static uint32_t TripTimeInv     = [236746,10029,6302,4980,4280,3837,3528,3296,3116,2971,
-                                        2850,2748,2660,2583,2516,2455,2401,2352,2308,2267];
+const static uint32_t TripTimeInv[20]     = {236746,10029,6302,4980,4280,3837,3528,3296,3116,2971,
+                                             2850,2748,2660,2583,2516,2455,2401,2352,2308,2267};
 // k = 13.5, a = 1
-const static uint32_t TripTimeVeryInv = [450000,13500,6750,4500,3375,2700,2250,1929,1688,
-										1500,1350,1227,1125,1038,964,900,844,794,750,711];
+const static uint32_t TripTimeVeryInv[20] = {450000,13500,6750,4500,3375,2700,2250,1929,1688,
+                                             1500,1350,1227,1125,1038,964,900,844,794,750,711};
 // k = 80, a = 2
-const static uint32_t TripTimeExtInv  = [1313629,26667,10000,5333,3333,2286,1667,1270,1000,
-										808,667,559,476,410,357,314,278,248,222,201];
+const static uint32_t TripTimeExtInv[20]  = {1313629,26667,10000,5333,3333,2286,1667,1270,1000,
+                                             808,667,559,476,410,357,314,278,248,222,201};
 
 										
 
@@ -105,20 +113,20 @@ const static uint32_t TripTimeExtInv  = [1313629,26667,10000,5333,3333,2286,1667
 #define NB_ANALOG_CHANNELS 3
 
 // Thread stacks
-OS_THREAD_STACK(InitModulesThreadStack, THREAD_STACK_SIZE);
+static uint32_t InitModulesThreadStack[THREAD_STACK_SIZE] __attribute__ ((aligned(0x08)));
 static uint32_t TripThreadStack[NB_ANALOG_CHANNELS][THREAD_STACK_SIZE] __attribute__ ((aligned(0x08)));
-static uint32_t SamplingThreadStacks[NB_ANALOG_CHANNELS][THREAD_STACK_SIZE] __attribute__ ((aligned(0x08)));
+static uint32_t SamplingThreadStack[NB_ANALOG_CHANNELS][THREAD_STACK_SIZE] __attribute__ ((aligned(0x08)));
 static uint32_t PacketThreadStack[THREAD_STACK_SIZE] __attribute__ ((aligned(0x08)));
 
 // Semaphores
-static OS_ECB* SamplingThreadSemaphore;
-static OS_ECB* TripThreadSemaphore;
+static OS_ECB* SamplingThreadSemaphore[NB_ANALOG_CHANNELS];
+static OS_ECB* TripThreadSemaphore[NB_ANALOG_CHANNELS];
 
 // Thread priorities
 // 0 = highest priority
 const uint8_t TRIP_THREAD_PRIORITY[NB_ANALOG_CHANNELS]     = {1, 2, 3};
 const uint8_t SAMPLING_THREAD_PRIORITY[NB_ANALOG_CHANNELS] = {4, 5, 6};
-const uint8_t PACKET_THREAD_PRIORITY = 7;
+const uint8_t PACKET_THREAD_PRIORITY                       = 7;
 
 
 
@@ -127,14 +135,14 @@ const uint8_t PACKET_THREAD_PRIORITY = 7;
 // ----------------------------------------
 
 // shortcut macro to improve readability in the sampling thread
-#define AnalogInputs Analog_Inputs[(uint8_t)pData]
+#define AnalogInputs Analog_Inputs[*(uint8_t*)pData]
 
 /* typedef struct   < extern'd from analog.h
 {
-  int16union_t value;                  < The current "processed" analog value (the user updates this value). 
-  int16union_t oldValue;               < The previous "processed" analog value (the user updates this value). 
+  float value;                         < The current "processed" analog value (the user updates this value).
+  float oldValue;                      < The previous "processed" analog value (the user updates this value).
   int16_t values[ANALOG_WINDOW_SIZE];  < An array of sample values to create a "sliding window". 
-  uint32_t time[ANALOG_WINDOW_SIZE];   /*!< Time stamp of the samples taken using OS_TimeGet().
+  uint32_t time[ANALOG_WINDOW_SIZE];   /*!< Time stamp of the samples taken using PIT_GetTime() in milliseconds
   int16_t* putPtr;                     < A pointer into the array of the last sample taken. 
 } TAnalogInput;
 
@@ -149,78 +157,87 @@ extern TAnalogInput Analog_Inputs[ANALOG_NB_INPUTS];  < Analog input channels. *
 // PRIVATE DOR FUNCTIONS
 // ----------------------------------------
 
-/*! Returns the true RMS value of an array of data of size 'samples' */
-static uint16_t GetRMS(int16_t data[], uint16_t samples)
+/*! @brief  Returns the true Vrms value of an array of analog data of size 'samples' taking into account analog normalisation
+ *  @param  array of data samples
+ *  @param  number of samples to get the RMS for
+ *  @return true RMS value of the set of data
+ *  */
+static float GetRMS(int16_t data[], uint16_t samples)
 {
-  // square all values in the array
+  // converting to voltage
   for (uint8_t i = 0; i < samples; i++)
-    data[i] = data[i]*data[i];
+    data[i] = data[i] / 3200;
 	
-  // find total of all values
-  uint16_t arrayTotal = 0;
+  // find total of all values squared
+  uint16_t squaredTotal = 0;
   for (uint8_t i = 0; i < samples; i++)
-    arrayTotal += (uint16_t)data[i]; // typecasting as data[] is signed
+    squaredTotal += (data[i]*data[i]);
 	
-  return sqrt(arrayTotal/samples);
+  return sqrt(squaredTotal/samples);
 }
 
-/*! Returns the frequency of a set of sinusoid samples */
-static float GetFreq(const TAnalogInput data[])
+
+/*! @brief  Returns the frequency given a set of sinusoid samples - note that this will only work for a sinusoid with zero DC offset
+ *  @param  array of data samples
+ *  @return frequency of the waveform based on the data
+ * */
+static float GetFreq(const int16_t data[])
 {
-	
-  uint32_t zeroCrossTime[2] = {0}; // time in OS ticks at which the waveform is 0
-  uint8_t crossingsFound = 0;      // crossings found so far (ranges from 0-2)
-  int16_t t1,t2,t3,t4 = 0,0,0,0;   // indexes to: sample just before 1st crossing, sample just after 1st crossing,
+  uint32_t zeroCrossTime[2] = {0}; // time in milliseconds at which the signal is 0
+  uint8_t crossingsFound    = 0;   // crossings found so far (ranges from 0-2)
+  int16_t t1=0, t2=0, t3=0, t4=0;  // indexes to: sample just before 1st crossing, sample just after 1st crossing,
                                    // sample just before 2nd crossing, and sample just after 2nd crossing respectively
 
   // If crossingsFound is >= 2, we already found two zero-crossings, so end the loop
   for (uint8_t i = 0; (i < ANALOG_WINDOW_SIZE-1) && (crossingsFound < 2); i++)
   {
     // crossing in between samples
-    if ((data[i] > 0 && data[i+1] < i) || 
-	    (data[i] < 0 && data[i+1] > i))
-	{
-	  switch (crossingsFound)
+    if ((data[i] > 0 && data[i+1] < 0) ||
+	      (data[i] < 0 && data[i+1] > 0))
 	  {
-		case 0: 
-		  t1 = i;
-		  t2 = i+1;
-		  crossingsFound++;
-		  break;
-		case 1:
-		  t3 = i;
-		  t4 = i+1;
-		  crossingsFound++
-		  break;
+	    switch (crossingsFound)
+	    {
+		    case 0:
+		      t1 = i;
+	  	    t2 = i+1;
+		      crossingsFound++;
+		      break;
+		    case 1:
+		      t3 = i;
+		      t4 = i+1;
+		      crossingsFound++;
+	    	  break;
+	    }
 	  }
-	}
 	
     // sample was exactly 0
     else if (data[i] == 0)
-	{
-	  zeroCrossTime[crossingsFound] = data[i];
-	  timeIndex++;
-	}
+	  {
+	    zeroCrossTime[crossingsFound] = data[i];
+	    crossingsFound++;
+	  }
   }
   
-  // Calculating zeroCrossTime, unless they were found from a perfect sample at exactly 0.
+  // Calculating zeroCrossTime, unless they were found from a perfect sample at exactly 0. For example:
   // If we have two samples on either side of a zero crossing at times t1 and t2 on a sin function x(t), then
   //                  (t2 - t1) * |x(t1)|
   // zeroCrossTime =  -------------------
   //                   |x(t1)| + |x(t2)|
   //
   // In the code below, x(t) is represented as data[t] and absolute values as the function abs()
+  // Times are in milliseconds, but converted back to seconds here by division by 1000
   
   if (!zeroCrossTime[0])
-	zeroCrossTime[0] = ((t2 - t1) * abs(data[t1])) / (abs(data[t1]) + abs(data[t2]));
+  	zeroCrossTime[0] = (((t2 - t1) * abs(data[t1])) / (abs(data[t1]) + abs(data[t2]))) / 1000;
   
   if (!zeroCrossTime[1])
-    zeroCrossTime[1] = ((t4 - t3) * abs(data[t3])) / (abs(data[t3]) + abs(data[t4]));
+    zeroCrossTime[1] = (((t4 - t3) * abs(data[t3])) / (abs(data[t3]) + abs(data[t4]))) / 1000;
 
 
-  // difference between zero crossings is half the period, and 1/period = frequency so 2/difference = frequency
-  return (1 / (2*(zeroCrossTime[1] - zeroCrossTime[2])));
+  // difference between the above zero crossings is half the period, and 1/period = frequency so 1/(2*difference) = frequency
+  return (1 / (2*(zeroCrossTime[1] - zeroCrossTime[0])));
 }
+
 
 
 // ----------------------------------------
@@ -239,8 +256,8 @@ bool HandleAnalogGetPacket(void)
   int16_t voltage;
   Analog_Get(Packet_Parameter1, &voltage);
   
-  // convert to current
-  int16_t current = (voltage*20)/7;
+  // convert to current from analog voltage data
+  int16_t current = ((voltage*20)/7) / 3200;
   
   // getting sign of current
   bool sign = true;
@@ -253,29 +270,34 @@ bool HandleAnalogGetPacket(void)
 
 /*! @brief Handles a packet to get various values about the DOR not already detailed in the tower protocol
  *
- *  Parameter1 = 0x0 (CharType), 0x1 (current freq.), 0x2 (TimesTripped), 0x3 (LastFaultType), 0x4 (SensitiveMode)
+ *  Parameter1 = 0x0 (CharType), 0x1 (current freq.), 0x2 (TimesTripped), 0x3 (lastFaultType), 0x4 (SensitiveMode)
  *  Parameter2 = 0x0, Parameter3 = channelNb (for freq)
  * 
  *  @return bool - TRUE if the packet was handled successfully, FALSE if parameter1 out of range
  */
 bool HandleDORValuesPacket(void)
 {
+  float freq;
+  uint8_t freqMSB, freqLSB; // whole number and decimal component of frequency
+  uint8_t lastFaultType;    // sum of trip threads' fault variables
+
   switch (Packet_Parameter1)
   {
     case 0: // Characteristic in use - stored in flash
-      return Packet_Put(CMD_DORVALUES, CharType, 0, 0);
+      return Packet_Put(CMD_DORVALUES, *CharType, 0, 0);
 
     case 1: // Frequency of currents
-	  float freq = GetFreq(Analog_Inputs[Packet_Parameter2]);
-	  uint8_t freqMSB = freq;                  // whole number frequency
-	  uint8_t freqLSB = (freq - freqMSB) * 10; // first decimal point
+	    freq = GetFreq(Analog_Inputs[Packet_Parameter2].values);
+	    freqMSB = freq;                  // whole number frequency
+	    freqLSB = (freq - freqMSB) * 10; // first decimal point
       return Packet_Put(CMD_DORVALUES, freqMSB, freqLSB, Packet_Parameter3);
 
     case 2: // Number of times tripped - stored in flash
-      return Packet_Put(CMD_DORVALUES, TimesTripped, 0, 0);
+      return Packet_Put(CMD_DORVALUES, *TimesTripped, 0, 0);
 
     case 3: // Type of last fault detected (3,2,1-phase)
-      return Packet_Put(CMD_DORVALUES, LastFaultType, 0, 0);
+      lastFaultType = ChannelFault[0] + ChannelFault[1] + ChannelFault[2];
+      return Packet_Put(CMD_DORVALUES, lastFaultType, 0, 0);
 
     case 4: // Sensitive mode
       return Packet_Put(CMD_DORVALUES, SensitiveMode, 0, 0);
@@ -297,7 +319,8 @@ bool HandleSetCharPacket(void)
   if (Packet_Parameter1 < 0 || Packet_Parameter1 > 2)
     return false;
 	
-  return Flash_Write8((uint8_t*)CharType, Packet_Parameter1);
+  Flash_Write8((uint8_t*)CharType, Packet_Parameter1);
+  return true;
 }
 
 /*! @brief Handles a packet to change the DOR between sensitive and nonsensitive fault mode
@@ -332,17 +355,17 @@ void HandlePacket(void)
 
   switch (Packet_Command)
   {
-	case CMD_ANALOGGET:
-	  success = HandleAnalogGetPacket();
+	  case CMD_ANALOGGET:
+	    success = HandleAnalogGetPacket();
       break;
     case CMD_DORVALUES:
-	  success = HandleDORValuesPacket();
+	    success = HandleDORValuesPacket();
       break;
-	case CMD_SETCHAR:
-	  success = HandleSetCharPacket();
-	  break;
-	case CMD_SETMODE:
-	  success = HandleSetModePacket();
+	  case CMD_SETCHAR:
+	    success = HandleSetCharPacket();
+	    break;
+	  case CMD_SETMODE:
+	    success = HandleSetModePacket();
     default:
       success = false;
       break;
@@ -368,7 +391,6 @@ void HandlePacket(void)
 }
 
 
-
 // ----------------------------------------
 // RTOS THREADS IN ORDER OF PRIORITY
 // ----------------------------------------
@@ -377,110 +399,145 @@ void HandlePacket(void)
  */
 static void InitModulesThread(void* pData)
 {
-  // Allocating private globals in non-volatile memory
-  Flash_AllocateVar((void*)&CharType, sizeof(*CharType));
-  Flash_AllocateVar((void*)&TimesTripped, sizeof(*TimesTripped));
-  
   // Creating semaphores
-  for (uint8_t i = 0; i < 3; i++)
-    SamplingThreadSemaphore = OS_SemaphoreCreate(0);
-  TripThreadSemaphore = OS_SemaphoreCreate(0);
+  for (uint8_t i = 0; i < NB_ANALOG_CHANNELS; i++)
+  {
+    SamplingThreadSemaphore[i] = OS_SemaphoreCreate(0);
+    TripThreadSemaphore[i]     = OS_SemaphoreCreate(0);
+  }
   
-  CharType = 1; // Inverse characteristic
-  
-  
+  // Module inits
+  Flash_Init();
+  UART_Init(115200, CPU_BUS_CLK_HZ);
   (void)Analog_Init(CPU_BUS_CLK_HZ);
 
   // Initialises the PIT to 20ms period (for 50Hz by default)
   PIT_Init(CPU_BUS_CLK_HZ, SamplingThreadSemaphore);
-  PIT_Set(2000000, true);
+  PIT_Set(20000000, true);
   PIT_Enable(true);
+
+  // Allocating private globals in non-volatile memory
+  Flash_AllocateVar((void*)&CharType, sizeof(*CharType));
+  Flash_AllocateVar((void*)&TimesTripped, sizeof(*TimesTripped));
+
+  Flash_Write8((uint8_t*)CharType, 1); // Inverse characteristic
+
+  // Start outputs at 0
+  Analog_Put(1, TIMING_SIGNAL_LOW);
+  Analog_Put(2, TRIP_SIGNAL_LOW);
 
   // We only do this once - therefore delete this thread
   OS_ThreadDelete(OS_PRIORITY_SELF);
 }
 
-// The “Timing” output signal is to be 0 V when Irms < 1.03 , and 5 V when 
-// Irms > 1.03 (for any phase A, B or C). The “Trip” output signal is to be 0 V 
-// when idle, and 5 V when active (operated by any phase A, B or C). The output 
-// signals are to be generated on Channel 1 and 2 (respectively) of the Tower 
-// outputs, utilising the analog board’s digital-to-analog converter.
 
 
 /*! @brief Thread to send a tripping signal through the DAC after a timeout period
  *  Tracks time elapsed in a local variable and keeps updating the new timer with each
  *  loop; waiting occurs at the end of each do-while loop, allowing for more samples
+ *  to update the timer; if a new sample is Irms < 1.03, end timing and reset everything
  */
 void TripThread(void* pData)
 {
-  static uint32_t TimeElapsed;  // Time elapsed since the current thread loop started
-  static uint32_t newTripTimer; // New timer based on the IMDT curves
-	
+  static uint32_t timeElapsed;       // Time elapsed since the current thread loop started in milliseconds
+  static uint32_t newTripTimer;      // New timer based on the IMDT curves in milliseconds
+  static uint32_t tripTimer;         // Time until next trip in milliseconds
+  static uint32_t startingTime;      // time at the start of a thread loop in milliseconds
+
+  uint32_t idmtCurve[20]; // temporary allocation of the trip timer IDMT curves based on the characteristic in use
+  float fractionalIrms; // fractional component of Irms
+
   for (;;)
   {
-	OS_TimeSet(0);
-	TimeElapsed = 0;
+    startingTime = PIT_GetTime();
 	
-	// OS_TimeGet gets the clock ticks since the thread loop has started last
-	// Then, if enough time hasnt yet passed on this check, then wait for the sempaphore
-	do
-	{
-	  // Updating time elapsed for this loop
-	  TimeElapsed += OS_TimeGet() / (CPU_BUS_CLK_HZ/1000);
-	  
-	  
-	  // Update new TripTimer based on the lookup tables
-	  // NEEDS INTERPOLATION FOR NON INTEGER VALUES OF AnalogInputs.value.l
-	  // remember that due to being uint type, AnalogInputs.value.l will always round down
-	  switch (CharType)
+	  // OS_TimeGet gets the clock ticks since the thread loop has started last
+	  // Then, if enough time hasnt yet passed on this check, then wait for the semaphore
+	  do
 	  {
-	    case 1: 
-	      newTripTimer = TripTimeInv[AnalogInputs.value.l];
-		  break;
+	    // Updating time elapsed for this loop. Uses difference between current time and the time at
+	    // the start of the loop so we don't need to use set a new timer which can mess up GetFreq()
+	    timeElapsed = (PIT_GetTime() - startingTime);
+	  
+	  
+	    // Assign correct IDMT lookup table to use for the timing calculation
+	    switch (*CharType)
+	    {
+	      case 1:
+	        for (uint8_t i = 0; i < 20; i++)
+	          idmtCurve[i] = TripTimeInv[i];
+		      break;
 		
-	    case 2: 
-	      newTripTimer = TripTimeVeryInv[AnalogInputs.value.l];
-		  break;
+	      case 2:
+          for (uint8_t i = 0; i < 20; i++)
+            idmtCurve[i] = TripTimeVeryInv[i];
+		      break;
 		
-	    case 3: 
-	      newTripTimer = TripTimeExtInv[AnalogInputs.value.l];
-	      break;
-		  
-		default: 
-		  newTripTimer = TripTimer; 
-		  break;
+	      case 3:
+          for (uint8_t i = 0; i < 20; i++)
+            idmtCurve[i] = TripTimeExtInv[i];
+	        break;
   	  }
+
+
+	    // interpolation of intermediate values in the lookup table
+	    // eg. for 15.2, newtripTimer = idmtCurve[16] + ((idmtCurve[16] - idmtCurve[15]) * 0.2)
+	    if (AnalogInputs.value < 20)
+	    {
+	      newTripTimer   = idmtCurve[(uint8_t)AnalogInputs.value + 1]; // Index is Irms rounded up
+	      fractionalIrms = AnalogInputs.value - (uint8_t)AnalogInputs.value;
+	      newTripTimer  += (newTripTimer - idmtCurve[(uint8_t)AnalogInputs.value]) * fractionalIrms;
+	    }
+	    else // minimum timeout
+	      newTripTimer = idmtCurve[20];
+
 	  
-	  // new timeout period is less, so the circuit breaker should be tripped immediately
-	  if (newTripTimer < TripTimer)
-		break;
-	  // new timeout period is greater, but some time has already elapsed so only add on a % of the new time
-	  else if (newTripTimer > TripTimer)
-		TripTimer += ((float)(TimeElapsed/TripTimer) * newTripTimer);
-	
-	  // else, trip timer has not changed, so continue as normal
+	    // new timeout period is less, so the circuit breaker should be tripped immediately
+	    if (newTripTimer < tripTimer)
+		    break;
+
+	    // new timeout period is greater, but some time has already elapsed so only continue for a % of the new time
+	    else if (newTripTimer > tripTimer)
+	    {
+		    tripTimer   = ((float)(1 - (timeElapsed/tripTimer)) * newTripTimer);
+		    timeElapsed = 0;
+	    }
+
+	    // else, trip timer has not changed, so continue as normal
 	
 	  
-	  // Blocks the thread (timing out after the TripTimer because if it
-	  // takes that long to get back then it should have passed anyway
-	  OS_SemaphoreWait(TripThreadSemaphore[(uint8_t)pData],TripTimer);
-	}
-	while (TimeElapsed < TripTimer);
+	    // Blocks the thread (timing out after the TripTimer because if it
+	    // takes that long to get back then it should have passed anyway
+	    // If Irms < 1.03 then reset the timer and keep blocking
+
+	    // If sensitive mode is on and the frequency is not within the
+	    // 47.5 -> 52.5 Hz range then also block the thread in the same way
+	    do
+	    {
+	      OS_SemaphoreWait(TripThreadSemaphore[*(uint8_t*)pData], tripTimer);
+
+	      if (AnalogInputs.value < 1.03 ||
+	         (SensitiveMode && (
+	         (GetFreq(Analog_Inputs[*(uint8_t*)pData].values) < 47.5) ||
+	         (GetFreq(Analog_Inputs[*(uint8_t*)pData].values) > 52.5))))
+	      {
+	        startingTime = PIT_GetTime();
+	        timeElapsed  = 0;
+	      }
+	    }
+	    while (AnalogInputs.value < 1.03);
+	  }
+	  while (timeElapsed < tripTimer);
 	
 	
-	
-	// Generate signal on channels 1 and 2
-	if (AnalogInputs.value.l > 1.03)
-	{
-	  Analog_Put(0, TRIP_SIGNAL_HIGH);
-      Analog_Put(1, TRIP_SIGNAL_HIGH);
-	  TimesTripped++;
-	}
-	else
-	{
-	  Analog_Put(0, TRIP_SIGNAL_LOW);
-      Analog_Put(1, TRIP_SIGNAL_LOW);
-	}
+    // Timer has expired, output the signal to trip the circuit breaker
+	  Analog_Put(2, TRIP_SIGNAL_HIGH);
+
+	  // Increment the number of times tripped in flash
+	  Flash_Write16((uint16_t*)TimesTripped, (*TimesTripped) + 1);
+
+	  // indicate a fault for this phase
+	  ChannelFault[*(uint8_t*)pData] = 1;
   }
 }
 
@@ -491,36 +548,44 @@ void TripThread(void* pData)
  */
 void SamplingThread(void* pData)
 {
-  uint16_t Vrms, Irms;  // RMS values of voltage and current
-	
+  float Vrms, Irms;  // RMS values of voltage and current
+	float freq;
+
   for (;;)
   {
-	OS_SemaphoreWait(SamplingThreadSemaphore[(uint8_t)pData],0);
+	  OS_SemaphoreWait(SamplingThreadSemaphore[*(uint8_t*)pData], 0);
 
-	// Shift data up the arrays
-	for (uint8_t i = 15; i > 0; i--)
-	  AnalogInputs.values[i] = AnalogInputs.values[i-1];
+	  // Shift data up the arrays
+	  for (uint8_t i = 15; i > 0; i--)
+	    AnalogInputs.values[i] = AnalogInputs.values[i-1];
   
-	// Get newest non-RMS voltage from the ADC for this channel
-	Analog_Get((uint8_t)pData, &AnalogInputs.values[0]);
-	// Time stamp the sample for frequency detection
-	time[0] = OS_TimeGet();
+	  // Get newest non-RMS voltage from the ADC for this channel
+	  Analog_Get(*(uint8_t*)pData, &AnalogInputs.values[0]);
+	  // Time stamp the sample for frequency detection
+	  AnalogInputs.time[0] = PIT_GetTime();
+	
+	  // Parse new true RMS current value and convert from analog values (3200 -> 1V)
+	  Vrms = GetRMS(AnalogInputs.values, ANALOG_WINDOW_SIZE);
+	  Irms = (Vrms*20)/7; // Circuitry is such that when Vrms = 350mV, Irms = 1
+	
+	  // Update global structure
+	  AnalogInputs.oldValue = AnalogInputs.value;
+	  AnalogInputs.value    = Irms;
+	
+	  // Finds the frequency for the new set of data and sets the new PIT accordingly (in nanoseconds)
+	  // 2nd parameter = false as we don't want to waste time resetting the clock
+	  freq = GetFreq(Analog_Inputs[*(uint8_t*)pData].values);
+	  PIT_Set(1000000000/freq, false);
 
-	
-	
-	// Parse new true RMS current value
-	Vrms = GetRMS(AnalogInputs.values, ANALOG_WINDOW_SIZE);
-	Irms = (Vrms*20)/7; // Circuitry is such that when Vrms = 350mV, Irms = 1
-	
-	// Update global structure
-	AnalogInputs.oldValue.l = AnalogInputs.value.l;
-	AnalogInputs.value.l    = Irms;
-	
-	// Finds the frequency for the new set of data and sets the new PIT accordingly (in ns)
-	// 2nd parameter = false as we don't want to waste time resetting the clock
-	PIT_SetTimer(1000000000/GetFreq(),false);
-	
-	OS_SemaphoreSignal(TripThreadSemaphore[(uint8_t)pData]);
+
+	  // If we are timing at all, then output a TRIP signal - only start timing if Irms > 1.03
+	  if (AnalogInputs.value > 1.03)
+	    Analog_Put(1, TIMING_SIGNAL_HIGH);
+	  else
+	    Analog_Put(1, TIMING_SIGNAL_LOW);
+
+	  // Even if not timing, we will still go into TripThread, but it will reset itself if Irms < 1.03s
+	  OS_SemaphoreSignal(TripThreadSemaphore[*(uint8_t*)pData]);
   }
 }
 
@@ -556,32 +621,32 @@ int main(void)
 
   // Create module initialisation thread
   error = OS_ThreadCreate(InitModulesThread,
-                          NULL,
-                          &InitModulesThreadStack[THREAD_STACK_SIZE - 1],
-                          0); // Highest priority
+          NULL,
+          &InitModulesThreadStack[THREAD_STACK_SIZE - 1],
+          0); // Highest priority
 
   // Create threads for 3 'Trip' + 'Timing' outputs
   for (uint8_t threadNb = 0; threadNb < NB_ANALOG_CHANNELS; threadNb++)
   {
     error = OS_ThreadCreate(TripThread,
-							threadNb,
-                            &TripThreadStacks[threadNb][THREAD_STACK_SIZE - 1],
-                            TRIP_THREAD_PRIORITY[threadNb]);
+						&threadNb,
+            &TripThreadStack[threadNb][THREAD_STACK_SIZE - 1],
+            TRIP_THREAD_PRIORITY[threadNb]);
   }
   
   // Create threads for 3 analog sampling channels
   for (uint8_t threadNb = 0; threadNb < NB_ANALOG_CHANNELS; threadNb++)
   {
     error = OS_ThreadCreate(SamplingThread,
-							threadNb,
-                            &SamplingThreadStacks[threadNb][THREAD_STACK_SIZE - 1],
-                            SAMPLING_THREAD_PRIORITY[threadNb]);
+						&threadNb,
+            &SamplingThreadStack[threadNb][THREAD_STACK_SIZE - 1],
+            SAMPLING_THREAD_PRIORITY[threadNb]);
   }
   
   error = OS_ThreadCreate(PacketThread,
-						  NULL,
-                          &PacketThreadStack[THREAD_STACK_SIZE - 1],
-	                      PACKET_THREAD_PRIORITY);
+					NULL,
+          &PacketThreadStack[THREAD_STACK_SIZE - 1],
+	        PACKET_THREAD_PRIORITY);
   
   // Start multithreading - never returns!
   OS_Start();
